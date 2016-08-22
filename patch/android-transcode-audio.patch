@@ -1,0 +1,198 @@
+From 74dbf9bec330168803cc5f3417aa39bd9260e98e Mon Sep 17 00:00:00 2001
+From: Cory Thompson <coryjthompson@gmail.com>
+Date: Thu, 11 Aug 2016 15:21:12 +1000
+Subject: [PATCH] Allow video with no audio stream present to be transcoded
+
+---
+ .../androidtranscoder/engine/MediaTranscoderEngine.java | 15 ++++++++++++---
+ .../engine/PassThroughTrackTranscoder.java              | 17 +++++++++++++----
+ .../ypresto/androidtranscoder/engine/QueuedMuxer.java   | 16 +++++++++++++---
+ .../format/Android16By9FormatStrategy.java              |  8 ++++++--
+ .../format/Android720pFormatStrategy.java               |  7 +++++--
+ .../androidtranscoder/utils/MediaExtractorUtils.java    |  4 ++--
+ 6 files changed, 51 insertions(+), 16 deletions(-)
+
+diff --git a/lib/src/main/java/net/ypresto/androidtranscoder/engine/MediaTranscoderEngine.java b/lib/src/main/java/net/ypresto/androidtranscoder/engine/MediaTranscoderEngine.java
+index 64a1ede..c883979 100644
+--- a/lib/src/main/java/net/ypresto/androidtranscoder/engine/MediaTranscoderEngine.java
++++ b/lib/src/main/java/net/ypresto/androidtranscoder/engine/MediaTranscoderEngine.java
+@@ -160,7 +160,12 @@ private void setupTrackTranscoders(MediaFormatStrategy formatStrategy) {
+             @Override
+             public void onDetermineOutputFormat() {
+                 MediaFormatValidator.validateVideoOutputFormat(mVideoTrackTranscoder.getDeterminedFormat());
+-                MediaFormatValidator.validateAudioOutputFormat(mAudioTrackTranscoder.getDeterminedFormat());
++
++                // If there is an audio track, validate the output is correct.
++                MediaFormat audioFormat = mAudioTrackTranscoder.getDeterminedFormat();
++                if (audioFormat != null) {
++                    MediaFormatValidator.validateAudioOutputFormat(audioFormat);
++                }
+             }
+         });
+ 
+@@ -170,14 +175,18 @@ public void onDetermineOutputFormat() {
+             mVideoTrackTranscoder = new VideoTrackTranscoder(mExtractor, trackResult.mVideoTrackIndex, videoOutputFormat, queuedMuxer);
+         }
+         mVideoTrackTranscoder.setup();
++        mExtractor.selectTrack(trackResult.mVideoTrackIndex);
++
+         if (audioOutputFormat == null) {
+             mAudioTrackTranscoder = new PassThroughTrackTranscoder(mExtractor, trackResult.mAudioTrackIndex, queuedMuxer, QueuedMuxer.SampleType.AUDIO);
+         } else {
+             mAudioTrackTranscoder = new AudioTrackTranscoder(mExtractor, trackResult.mAudioTrackIndex, audioOutputFormat, queuedMuxer);
+         }
++
++        if (trackResult.mAudioTrackIndex >= 0) {
++            mExtractor.selectTrack(trackResult.mAudioTrackIndex);
++        }
+         mAudioTrackTranscoder.setup();
+-        mExtractor.selectTrack(trackResult.mVideoTrackIndex);
+-        mExtractor.selectTrack(trackResult.mAudioTrackIndex);
+     }
+ 
+     private void runPipelines() {
+diff --git a/lib/src/main/java/net/ypresto/androidtranscoder/engine/PassThroughTrackTranscoder.java b/lib/src/main/java/net/ypresto/androidtranscoder/engine/PassThroughTrackTranscoder.java
+index 7608dac..5813b8b 100644
+--- a/lib/src/main/java/net/ypresto/androidtranscoder/engine/PassThroughTrackTranscoder.java
++++ b/lib/src/main/java/net/ypresto/androidtranscoder/engine/PassThroughTrackTranscoder.java
+@@ -42,10 +42,19 @@ public PassThroughTrackTranscoder(MediaExtractor extractor, int trackIndex,
+         mMuxer = muxer;
+         mSampleType = sampleType;
+ 
+-        mActualOutputFormat = mExtractor.getTrackFormat(mTrackIndex);
+-        mMuxer.setOutputFormat(mSampleType, mActualOutputFormat);
+-        mBufferSize = mActualOutputFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE);
+-        mBuffer = ByteBuffer.allocateDirect(mBufferSize).order(ByteOrder.nativeOrder());
++        if (trackIndex >= 0) {
++            mActualOutputFormat = mExtractor.getTrackFormat(mTrackIndex);
++            mMuxer.setOutputFormat(mSampleType, mActualOutputFormat);
++            mBufferSize = mActualOutputFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE);
++            mBuffer = ByteBuffer.allocateDirect(mBufferSize).order(ByteOrder.nativeOrder());
++        } else {
++            // track has no audio. Passthrough should also exclude the track.
++            mMuxer.setOutputFormat(mSampleType, null);
++
++            // Nothing to do. EOS and report it took us 0 ms.
++            mIsEOS = true;
++            mWrittenPresentationTimeUs = 0;
++        }
+     }
+ 
+     @Override
+diff --git a/lib/src/main/java/net/ypresto/androidtranscoder/engine/QueuedMuxer.java b/lib/src/main/java/net/ypresto/androidtranscoder/engine/QueuedMuxer.java
+index df58e99..bc17a74 100644
+--- a/lib/src/main/java/net/ypresto/androidtranscoder/engine/QueuedMuxer.java
++++ b/lib/src/main/java/net/ypresto/androidtranscoder/engine/QueuedMuxer.java
+@@ -30,6 +30,7 @@
+  */
+ public class QueuedMuxer {
+     private static final String TAG = "QueuedMuxer";
++    private static final int EXCLUDE_TRACK_INDEX = -1;
+     private static final int BUFFER_SIZE = 64 * 1024; // I have no idea whether this value is appropriate or not...
+     private final MediaMuxer mMuxer;
+     private final Listener mListener;
+@@ -54,6 +55,11 @@ public void setOutputFormat(SampleType sampleType, MediaFormat format) {
+                 break;
+             case AUDIO:
+                 mAudioFormat = format;
++
++                if(format == null) {
++                    // Tell the muxer we do not require audio.
++                    mAudioTrackIndex = EXCLUDE_TRACK_INDEX;
++                }
+                 break;
+             default:
+                 throw new AssertionError();
+@@ -62,13 +68,17 @@ public void setOutputFormat(SampleType sampleType, MediaFormat format) {
+     }
+ 
+     private void onSetOutputFormat() {
+-        if (mVideoFormat == null || mAudioFormat == null) return;
++        if (mVideoFormat == null || (mAudioFormat == null && mAudioTrackIndex != EXCLUDE_TRACK_INDEX)) return;
+         mListener.onDetermineOutputFormat();
+ 
+         mVideoTrackIndex = mMuxer.addTrack(mVideoFormat);
+         Log.v(TAG, "Added track #" + mVideoTrackIndex + " with " + mVideoFormat.getString(MediaFormat.KEY_MIME) + " to muxer");
+-        mAudioTrackIndex = mMuxer.addTrack(mAudioFormat);
+-        Log.v(TAG, "Added track #" + mAudioTrackIndex + " with " + mAudioFormat.getString(MediaFormat.KEY_MIME) + " to muxer");
++
++        if(mAudioFormat != null) {
++            mAudioTrackIndex = mMuxer.addTrack(mAudioFormat);
++            Log.v(TAG, "Added track #" + mAudioTrackIndex + " with " + mAudioFormat.getString(MediaFormat.KEY_MIME) + " to muxer");
++        }
++
+         mMuxer.start();
+         mStarted = true;
+ 
+diff --git a/lib/src/main/java/net/ypresto/androidtranscoder/format/Android16By9FormatStrategy.java b/lib/src/main/java/net/ypresto/androidtranscoder/format/Android16By9FormatStrategy.java
+index faf3031..41d8fd6 100644
+--- a/lib/src/main/java/net/ypresto/androidtranscoder/format/Android16By9FormatStrategy.java
++++ b/lib/src/main/java/net/ypresto/androidtranscoder/format/Android16By9FormatStrategy.java
+@@ -61,10 +61,14 @@ public MediaFormat createVideoOutputFormat(MediaFormat inputFormat) {
+         if (longer * 9 != shorter * 16) {
+             throw new OutputFormatUnavailableException("This video is not 16:9, and is not able to transcode. (" + width + "x" + height + ")");
+         }
++
++        /*
++        I've commented this out because its unsafe to assume the user wants to bypass compression if resolution is equal.
+         if (shorter <= targetShorter) {
+             Log.d(TAG, "This video's height is less or equal to " + targetShorter + ", pass-through. (" + width + "x" + height + ")");
+             return null;
+-        }
++        }*/
++
+         MediaFormat format = MediaFormat.createVideoFormat("video/avc", outWidth, outHeight);
+         // From Nexus 4 Camera in 720p
+         format.setInteger(MediaFormat.KEY_BIT_RATE, mVideoBitrate);
+@@ -76,7 +80,7 @@ public MediaFormat createVideoOutputFormat(MediaFormat inputFormat) {
+ 
+     @Override
+     public MediaFormat createAudioOutputFormat(MediaFormat inputFormat) {
+-        if (mAudioBitrate == AUDIO_BITRATE_AS_IS || mAudioChannels == AUDIO_CHANNELS_AS_IS) return null;
++        if (inputFormat == null || mAudioBitrate == AUDIO_BITRATE_AS_IS || mAudioChannels == AUDIO_CHANNELS_AS_IS) return null;
+ 
+         // Use original sample rate, as resampling is not supported yet.
+         final MediaFormat format = MediaFormat.createAudioFormat(MediaFormatExtraConstants.MIMETYPE_AUDIO_AAC,
+diff --git a/lib/src/main/java/net/ypresto/androidtranscoder/format/Android720pFormatStrategy.java b/lib/src/main/java/net/ypresto/androidtranscoder/format/Android720pFormatStrategy.java
+index dc59caa..c910055 100644
+--- a/lib/src/main/java/net/ypresto/androidtranscoder/format/Android720pFormatStrategy.java
++++ b/lib/src/main/java/net/ypresto/androidtranscoder/format/Android720pFormatStrategy.java
+@@ -63,10 +63,13 @@ public MediaFormat createVideoOutputFormat(MediaFormat inputFormat) {
+         if (longer * 9 != shorter * 16) {
+             throw new OutputFormatUnavailableException("This video is not 16:9, and is not able to transcode. (" + width + "x" + height + ")");
+         }
++
++        /*
++        I've commented this out because its unsafe to assume the user wants to bypass compression if resolution is equal.
+         if (shorter <= SHORTER_LENGTH) {
+             Log.d(TAG, "This video is less or equal to 720p, pass-through. (" + width + "x" + height + ")");
+             return null;
+-        }
++        }*/
+         MediaFormat format = MediaFormat.createVideoFormat("video/avc", outWidth, outHeight);
+         // From Nexus 4 Camera in 720p
+         format.setInteger(MediaFormat.KEY_BIT_RATE, mVideoBitrate);
+@@ -78,7 +81,7 @@ public MediaFormat createVideoOutputFormat(MediaFormat inputFormat) {
+ 
+     @Override
+     public MediaFormat createAudioOutputFormat(MediaFormat inputFormat) {
+-        if (mAudioBitrate == AUDIO_BITRATE_AS_IS || mAudioChannels == AUDIO_CHANNELS_AS_IS) return null;
++        if (inputFormat == null || mAudioBitrate == AUDIO_BITRATE_AS_IS || mAudioChannels == AUDIO_CHANNELS_AS_IS) return null;
+ 
+         // Use original sample rate, as resampling is not supported yet.
+         final MediaFormat format = MediaFormat.createAudioFormat(MediaFormatExtraConstants.MIMETYPE_AUDIO_AAC,
+diff --git a/lib/src/main/java/net/ypresto/androidtranscoder/utils/MediaExtractorUtils.java b/lib/src/main/java/net/ypresto/androidtranscoder/utils/MediaExtractorUtils.java
+index b973d2f..a6607db 100644
+--- a/lib/src/main/java/net/ypresto/androidtranscoder/utils/MediaExtractorUtils.java
++++ b/lib/src/main/java/net/ypresto/androidtranscoder/utils/MediaExtractorUtils.java
+@@ -55,8 +55,8 @@ public static TrackResult getFirstVideoAndAudioTrack(MediaExtractor extractor) {
+             }
+             if (trackResult.mVideoTrackIndex >= 0 && trackResult.mAudioTrackIndex >= 0) break;
+         }
+-        if (trackResult.mVideoTrackIndex < 0 || trackResult.mAudioTrackIndex < 0) {
+-            throw new IllegalArgumentException("extractor does not contain video and/or audio tracks.");
++        if (trackResult.mVideoTrackIndex < 0) {
++            throw new IllegalArgumentException("extractor does not contain video tracks.");
+         }
+         return trackResult;
+     }
